@@ -5,6 +5,10 @@ from bs4 import BeautifulSoup
 import time
 import pandas as pd
 from collections import Counter
+import networkx as nx
+from itertools import combinations
+import html
+import unicodedata
 
 #web of science api key
 API_KEY = os.environ.get('WOS_API_KEY')
@@ -127,140 +131,101 @@ print("Latest year:", df["year"].max())
 
 print("\nPapers by year:")
 print(df["year"].value_counts().sort_index())
-'''
 
-# Convert to DataFrame
-df = pd.DataFrame(all_papers)
 
-# Save dataset
-df.to_csv("umd_wos_publications.csv", index=False)
-print("Total papers:", len(df))
-print("Earliest year:", df["year"].min())
-print("Latest year:", df["year"].max())
-
-print("\nPapers by year:")
-print(df["year"].value_counts().sort_index())
-print("Saved publications to csv file.")
-Extracting basic information
-        uid = paper.get("uid")
-        title = paper.get("title")
-        year = paper.get("source", {}).get("publishYear")
-
-        #Extracting author names
-        authors = paper.get("names", {}).get("authors", [])
-        author_names = [
-            author.get("displayName")
-            for author in authors
-        ]
-
-        #Extracting author keywords
-        keywords = paper.get("keywords", {}).get("authorKeywords", [])
-
-        #put information in a dictionary for better search
-        all_papers.append({
-            "uid": uid,
-            "title": title,
-            "year": year,
-            "authors": author_names,
-            "keywords": keywords
-        })
-
-    # Small pause between requests. To avoid rate limiting.
-    
-
-print()
-print("Total papers collected:", len(all_papers))
-
-# Convert to DataFrame
-df = pd.DataFrame(all_papers)
-#print first 5 papers and info
-print(df.head())
-df.to_csv("umd_wos_publications.csv", index=False)
-print("Saved publications to csv file.")
-print("Total papers:", len(df))
-print("Earliest year:", df["year"].min())
-print("Latest year:", df["year"].max())
-
-print("\nPapers by year:")
-print(df["year"].value_counts().sort_index())
-
-- now we have all our data in a csv file.
-- I queried WOS for publications at UMD and restricted pubs to 2021-2025 and articles and reviews only. Stored each pub UID so they can be traced back to the WOS. Used author keywords to construct a research-topic network.
-- next, I need to use this data and networkx mod to calculate centrality and 3 most connected research topics.
-- key note: I am using a subset of the UMD research data (1000 pubs) so in my final findings, I should emphasize this sample.
-
+#starting network analysis
 import re
 import unicodedata
 
 def clean_keyword(keyword):
-    # Convert to string
     keyword = str(keyword)
-
-    # Normalize Unicode characters
-    keyword = unicodedata.normalize("NFKC", keyword)
-
-    # Remove leading/trailing whitespace
-    keyword = keyword.strip()
-
-    # Convert everything to lowercase
+    keyword = html.unescape(keyword) #was getting keywords with html attached
+    keyword = unicodedata.normalize("NFKC", keyword) #normalize unicode
+    keyword = keyword.strip() #remove white space
     keyword = keyword.casefold()
-
-    # Replace repeated whitespace with a single space
     keyword = re.sub(r"\s+", " ", keyword)
-
+    if not re.search(r"[a-zA-Z0-9]", keyword):
+        return None
     return keyword
 
-
-# Apply cleaning to every paper's keyword list
+# Clean keywords for every paper
 df["clean_keywords"] = df["keywords"].apply(
-    lambda keywords: list(set(clean_keyword(k) for k in keywords))
+    lambda keywords: list(
+        set(cleaned for cleaned in (clean_keyword(k) for k in keywords)
+            if cleaned is not None)))
+
+
+# Basic keyword statistics
+papers_with_keywords = df[
+    df["clean_keywords"].apply(len) > 0
+]
+
+papers_with_2plus_keywords = df[
+    df["clean_keywords"].apply(len) >= 2
+]
+
+print("Total papers:", len(df))
+print("Papers with keywords:", len(papers_with_keywords))
+print(
+    "Papers with 2+ keywords:",
+    len(papers_with_2plus_keywords)
 )
 
-# Show some examples
-print(df[["keywords", "clean_keywords"]].head(10))
+print(
+    "Papers without enough keywords to form an edge:",
+    len(df) - len(papers_with_2plus_keywords)
+)
 
-raw_keywords = {
-    keyword
-    for keyword_list in df["keywords"]
-    for keyword in keyword_list
-}
 
-cleaned_keywords = {
+# Count total and unique cleaned keywords
+
+all_keywords = [
     keyword
     for keyword_list in df["clean_keywords"]
     for keyword in keyword_list
-}
+]
 
-#figured out a limitation: 
-# only 3 keyword-containing papers are unable to produce an edge because they have exactly one keyword. The other 344 papers have no author keywords at all.
-import networkx as nx
-from itertools import combinations
+print("Total keyword occurrences:", len(all_keywords))
+print("Unique keywords:", len(set(all_keywords)))
+keyword_counts = Counter(all_keywords)
 
+print("\nTop 20 keywords:")
+for keyword, count in keyword_counts.most_common(20):
+    print(f"{keyword}: {count}")
+'''
+From this outut: 878 papers have at least one author keyword,877 papers have at least two keywords, 123 papers have no author keywords, 4589 keywords occurences, 3600 unique cleaned keywords.
+'''
+
+#start the graph
 # Create an undirected graph
 G = nx.Graph()
-
+#clean and remove duplicate keywords
 for keywords in df["clean_keywords"]:
 
-    # Remove duplicate keywords within a paper
+    # Remove duplicate keywords within the same paper
     keywords = sorted(set(keywords))
 
-    # Add each keyword as a node
+    # Add keywords as nodes
     G.add_nodes_from(keywords)
 
-    # Create an edge between every pair of keywords
-    # that appears in the same paper
-    for keyword1, keyword2 in combinations(keywords, 2):
-        G.add_edge(keyword1, keyword2)
+    # Connect every pair of keywords in the same paper
+    for topic1, topic2 in combinations(keywords, 2):
+
+        # if this pair already exists, increase its weight
+        if G.has_edge(topic1, topic2):
+            G[topic1][topic2]["weight"] += 1
+        else:
+            G.add_edge(topic1, topic2, weight=1)
 
 print("Number of nodes:", G.number_of_nodes())
 print("Number of edges:", G.number_of_edges())
-# Calculate degree centrality
-degree_centrality = nx.degree_centrality(G)
-
-# Calculate raw degree
+# Degree = number of distinct topics directly connected
 degree = dict(G.degree())
 
-# Create a table
+# Degree centrality = normalized degree
+degree_centrality = nx.degree_centrality(G)
+
+# Build results table
 centrality_df = pd.DataFrame({
     "topic": list(G.nodes()),
     "degree": [degree[node] for node in G.nodes()],
@@ -269,6 +234,15 @@ centrality_df = pd.DataFrame({
         for node in G.nodes()
     ]
 })
+topic_paper_count = Counter()
+
+for keywords in df["clean_keywords"]:
+    for topic in set(keywords):
+        topic_paper_count[topic] += 1
+
+centrality_df["paper_count"] = centrality_df["topic"].map(
+    topic_paper_count
+)
 
 # Sort by degree centrality
 centrality_df = centrality_df.sort_values(
@@ -276,93 +250,67 @@ centrality_df = centrality_df.sort_values(
     ascending=False
 )
 
-#print(centrality_df.head(20).to_string(index=False))
-    
-    3,173 nodes and 9,550 edges.
-    most connected topics: noise, topology, climate change. 
-    are 'noise' and 'topology' actually highly connected accross UMD research or are they being driven by a small number of papers?
-    
-#compare centrality with publication frequency
-# Count how many different papers contain each topic
-topic_paper_count = Counter()
-
-for keywords in df["clean_keywords"]:
-    for keyword in set(keywords):
-        topic_paper_count[keyword] += 1
-
-# Add paper frequency to the centrality dataframe
-centrality_df["paper_count"] = centrality_df["topic"].map(topic_paper_count)
-
 print(
     centrality_df[
         ["topic", "degree", "degree_centrality", "paper_count"]
     ].head(20).to_string(index=False)
 )
-# Most frequently appearing topics
-frequency_df = (
-    centrality_df[
-        ["topic", "paper_count", "degree", "degree_centrality"]
-    ]
-    .sort_values("paper_count", ascending=False)
-)
-
-print(frequency_df.head(20).to_string(index=False))
-
-I also noticed that 3,170 cleaned unique keywords does not equal 3,173 nodes but it should. maybe check the 3 extra keywords?
-
-all_clean_keywords = {
-    keyword
-    for keyword_list in df["clean_keywords"]
-    for keyword in keyword_list
-}
-
-print("Unique keywords in dataframe:", len(all_clean_keywords))
-print("Nodes in graph:", G.number_of_nodes())
-
-extra_nodes = set(G.nodes()) - all_clean_keywords
-
-print("Extra graph nodes:", extra_nodes)
-#why is topology and noise at the top
-top_topics = ["noise", "topology", "climate change"]
+'''
+Okay so we now see that the top topics are mental health, gender, race, covid-19, and machine learning. but why? lets see what is sitting around each node.
+'''
+top_topics = [
+    "mental health",
+    "covid-19",
+    "race",
+    "gender",
+    "machine learning"
+]
 
 for topic in top_topics:
-    print("\n" + "=" * 70)
-    print(f"TOPIC: {topic}")
-    print("=" * 70)
+    print(f"\n{topic.upper()}")
+    
 
-    # Papers containing this topic
-    matching_papers = df[
-        df["clean_keywords"].apply(
-            lambda keywords: topic in keywords
-        )
+    neighbors = list(G.neighbors(topic))
+
+    print("Number of connections:", len(neighbors))
+    print("Connected topics:")
+
+    for neighbor in sorted(neighbors):
+        weight = G[topic][neighbor]["weight"]
+        print(f"  {neighbor}  (co-occurrences: {weight})")
+#lets also check if the centrality is valid. ex: one paper isnt inflating the degree. (it happened last time)
+
+for topic in top_topics:
+
+    print(f"\n{topic.upper()}")
+
+    neighbors_with_weights = [
+        (neighbor, G[topic][neighbor]["weight"])
+        for neighbor in G.neighbors(topic)
     ]
 
-    print(f"Papers containing '{topic}': {len(matching_papers)}")
+    neighbors_with_weights.sort(
+        key=lambda x: x[1],
+        reverse=True
+    )
 
-    for _, paper in matching_papers.iterrows():
-        print("\nTitle:", paper["title"])
-        print("Year:", paper["year"])
-        print("Keywords:", paper["clean_keywords"])
-# is my network dominated by a lot of disconnected clusters?
-# Basic network statistics
+    print("Top 10 strongest connections:")
 
-num_nodes = G.number_of_nodes()
-num_edges = G.number_of_edges()
+    for neighbor, weight in neighbors_with_weights[:10]:
+        print(f"{neighbor}: {weight}")
 
-average_degree = (2 * num_edges) / num_nodes
-
-components = list(nx.connected_components(G))
-
-print("Nodes:", num_nodes)
-print("Edges:", num_edges)
-print(f"Average degree: {average_degree:.2f}")
-print("Connected components:", len(components))
-
-largest_component = max(components, key=len)
-
-print(
-    "Largest connected component:",
-    len(largest_component),
-    "nodes"
+#graph visualization
+# Export graph for Gephi
+nx.write_graphml(
+    G,
+    "umd_research_topics.graphml"
 )
-'''
+
+# Export centrality results
+centrality_df.to_csv(
+    "umd_topic_centrality.csv",
+    index=False
+)
+
+print("Graph saved: umd_research_topics.graphml")
+print("Centrality table saved: umd_topic_centrality.csv")
